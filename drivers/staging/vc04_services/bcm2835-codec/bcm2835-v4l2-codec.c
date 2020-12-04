@@ -90,7 +90,7 @@ static const char * const components[] = {
 };
 
 /* Timeout for stop_streaming to allow all buffers to return */
-#define COMPLETE_TIMEOUT (2 * HZ)
+#define COMPLETE_TIMEOUT (4 * HZ)
 
 #define MIN_W		32
 #define MIN_H		32
@@ -531,6 +531,7 @@ struct bcm2835_codec_ctx {
 	bool aborting;
 	int num_ip_buffers;
 	int num_op_buffers;
+	int eos_buffers_to_go;
 	struct completion frame_cmplt;
 };
 
@@ -795,9 +796,11 @@ static void send_eos_event(struct bcm2835_codec_ctx *ctx)
 		.type = V4L2_EVENT_EOS,
 	};
 
-	v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "Sending EOS event\n");
-
-	v4l2_event_queue_fh(&ctx->fh, &ev);
+	if (--ctx->eos_buffers_to_go <= 0) {
+		v4l2_event_queue_fh(&ctx->fh, &ev);
+		v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "Sending EOS event\n");
+	}
+	v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "Waiting for %u empty buffers to be returned\n", ctx->eos_buffers_to_go);
 }
 
 static void color_mmal2v4l(struct bcm2835_codec_ctx *ctx, u32 mmal_color_space)
@@ -909,16 +912,17 @@ static void op_buffer_cb(struct vchiq_mmal_instance *instance,
 		v4l2_dbg(2, debug, &ctx->dev->v4l2_dev, "%s: Empty buffer - flags %04x",
 			 __func__, mmal_buf->mmal_flags);
 		if (!mmal_buf->mmal_flags & MMAL_BUFFER_HEADER_FLAG_EOS) {
-			vb2_buffer_done(&vb2->vb2_buf, VB2_BUF_STATE_ERROR);
 			if (!port->enabled)
 				complete(&ctx->frame_cmplt);
+			send_eos_event(ctx);
 			return;
 		}
 	}
 	if (mmal_buf->mmal_flags & MMAL_BUFFER_HEADER_FLAG_EOS) {
 		/* EOS packet from the VPU */
-		send_eos_event(ctx);
+		v4l2_dbg(2, debug, &ctx->dev->v4l2_dev, "buf mmal EOS in buffer %d", vb2->vb2_buf.index);
 		vb2->flags |= V4L2_BUF_FLAG_LAST;
+		send_eos_event(ctx);
 	}
 
 	/* vb2 timestamps in nsecs, mmal in usecs */
@@ -2328,6 +2332,13 @@ static int bcm2835_codec_start_streaming(struct vb2_queue *q,
 			v4l2_err(&ctx->dev->v4l2_dev, "%s: Failed enabling o/p port, ret %d\n",
 				 __func__, ret);
 	}
+
+	if (!V4L2_TYPE_IS_OUTPUT(q->type)) {
+		ctx->eos_buffers_to_go = 0;
+		ctx->eos_buffers_to_go = port->current_buffer.num + 1;
+		v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "%d buffers in the queue\n",
+				 ctx->eos_buffers_to_go);
+	}
 	return ret;
 }
 
@@ -2338,26 +2349,12 @@ static void bcm2835_codec_stop_streaming(struct vb2_queue *q)
 	struct bcm2835_codec_q_data *q_data = get_q_data(ctx, q->type);
 	struct vchiq_mmal_port *port = get_port_data(ctx, q->type);
 	struct vb2_v4l2_buffer *vbuf;
-	int ret;
+	int ret, i;
 
 	v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "%s: type: %d - return buffers\n",
 		 __func__, q->type);
 
 	init_completion(&ctx->frame_cmplt);
-
-	/* Clear out all buffers held by m2m framework */
-	for (;;) {
-		if (V4L2_TYPE_IS_OUTPUT(q->type))
-			vbuf = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
-		else
-			vbuf = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-		if (!vbuf)
-			break;
-		v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "%s: return buffer %p\n",
-			 __func__, vbuf);
-
-		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_ERROR);
-	}
 
 	/* Disable MMAL port - this will flush buffers back */
 	ret = vchiq_mmal_port_disable(dev->instance, port);
@@ -2365,6 +2362,13 @@ static void bcm2835_codec_stop_streaming(struct vb2_queue *q)
 		v4l2_err(&ctx->dev->v4l2_dev, "%s: Failed disabling %s port, ret %d\n",
 			 __func__, V4L2_TYPE_IS_OUTPUT(q->type) ? "i/p" : "o/p",
 			 ret);
+
+	/* Check if buffers are still in active state */
+	for (i = 0; i < q->num_buffers; i++) {	
+		if (q->bufs[i]->state == VB2_BUF_STATE_ACTIVE) {
+			vb2_buffer_done(q->bufs[i], VB2_BUF_STATE_ERROR);
+		}	
+	}
 
 	while (atomic_read(&port->buffers_with_vpu)) {
 		v4l2_dbg(1, debug, &ctx->dev->v4l2_dev, "%s: Waiting for buffers to be returned - %d outstanding\n",
